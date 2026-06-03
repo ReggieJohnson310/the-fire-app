@@ -1,0 +1,868 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+import os
+import logging
+import asyncio
+import bcrypt
+import jwt
+import secrets
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+import uuid
+from datetime import datetime, timezone, timedelta
+from emergentintegrations.payments.stripe.checkout import (
+    StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+)
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TwilioClient = None
+    TWILIO_AVAILABLE = False
+
+# MongoDB connection
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+db = client[os.environ.get('DB_NAME', 'test_database')]
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+JWT_ALGORITHM = "HS256"
+
+# ── Subscription Plans ──────────────────────────────────
+
+SUBSCRIPTION_PLANS = {
+    "free": {"name": "Free", "price": 0.0, "max_contacts": 1, "features": ["Basic smoke detection", "1 emergency contact", "Local alarm only"], "duration_days": 0},
+    "pro": {"name": "Pro", "price": 3.99, "max_contacts": 5, "features": ["5 contacts + EMT auto-dial", "GPS sharing", "Call history", "Priority alerts"], "duration_days": 30},
+    "family": {"name": "Family", "price": 7.99, "max_contacts": 5, "features": ["Multi-device sync (5 phones)", "SMS alerts to family", "Cloud alert logs", "All Pro features"], "duration_days": 30},
+}
+
+# ── Password Helpers ────────────────────────────────────
+
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+
+# ── JWT Helpers ─────────────────────────────────────────
+
+def get_jwt_secret() -> str:
+    return os.environ.get("JWT_SECRET", "default-change-me-in-production")
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(minutes=60), "type": "access"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+def create_refresh_token(user_id: str) -> str:
+    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=3600, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user["_id"] = str(user["_id"])
+        user.pop("password_hash", None)
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_optional_user(request: Request) -> Optional[dict]:
+    try:
+        return await get_current_user(request)
+    except HTTPException:
+        return None
+
+# ── Auth Models ─────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# ── Auth Endpoints ──────────────────────────────────────
+
+@api_router.post("/auth/register")
+async def register(data: RegisterRequest, response: Response):
+    email = data.email.strip().lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    user_doc = {
+        "email": email,
+        "password_hash": hash_password(data.password),
+        "name": data.name or email.split("@")[0],
+        "role": "user",
+        "subscription": "free",
+        "subscription_expires": None,
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await db.users.insert_one(user_doc)
+    user_id = str(result.inserted_id)
+    
+    access = create_access_token(user_id, email)
+    refresh = create_refresh_token(user_id)
+    set_auth_cookies(response, access, refresh)
+    
+    return {
+        "id": user_id, "email": email, "name": user_doc["name"],
+        "role": "user", "subscription": "free",
+        "access_token": access, "refresh_token": refresh
+    }
+
+@api_router.post("/auth/login")
+async def login(data: LoginRequest, request: Request, response: Response):
+    email = data.email.strip().lower()
+    ip = request.client.host if request.client else "unknown"
+    identifier = f"{ip}:{email}"
+    
+    # Brute force check
+    attempts = await db.login_attempts.find_one({"identifier": identifier})
+    if attempts and attempts.get("count", 0) >= 5:
+        last = attempts.get("last_attempt")
+        if last and isinstance(last, datetime):
+            last_aware = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last_aware).total_seconds() < 900:
+                raise HTTPException(status_code=429, detail="Too many attempts. Try again in 15 minutes.")
+    
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        await db.login_attempts.update_one(
+            {"identifier": identifier},
+            {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # Clear attempts on success
+    await db.login_attempts.delete_one({"identifier": identifier})
+    
+    user_id = str(user["_id"])
+    access = create_access_token(user_id, email)
+    refresh = create_refresh_token(user_id)
+    set_auth_cookies(response, access, refresh)
+    
+    # Check subscription status
+    sub = user.get("subscription", "free")
+    sub_expires = user.get("subscription_expires")
+    if sub_expires and isinstance(sub_expires, datetime) and sub != "free":
+        exp = sub_expires if sub_expires.tzinfo else sub_expires.replace(tzinfo=timezone.utc)
+        if exp < datetime.now(timezone.utc):
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"subscription": "free", "subscription_expires": None}})
+            sub = "free"
+    
+    return {
+        "id": user_id, "email": email, "name": user.get("name", ""),
+        "role": user.get("role", "user"), "subscription": sub,
+        "access_token": access, "refresh_token": refresh
+    }
+
+@api_router.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return {"status": "logged out"}
+
+@api_router.get("/auth/me")
+async def get_me(request: Request):
+    user = await get_current_user(request)
+    sub = user.get("subscription", "free")
+    sub_expires = user.get("subscription_expires")
+    if sub_expires and isinstance(sub_expires, datetime) and sub != "free":
+        exp = sub_expires if sub_expires.tzinfo else sub_expires.replace(tzinfo=timezone.utc)
+        if exp < datetime.now(timezone.utc):
+            await db.users.update_one({"_id": ObjectId(user["_id"])}, {"$set": {"subscription": "free", "subscription_expires": None}})
+            sub = "free"
+            user["subscription"] = "free"
+    return {
+        "id": user["_id"], "email": user["email"], "name": user.get("name", ""),
+        "role": user.get("role", "user"), "subscription": sub,
+        "subscription_expires": sub_expires.isoformat() if isinstance(sub_expires, datetime) else None,
+    }
+
+@api_router.post("/auth/refresh")
+async def refresh_token(request: Request, response: Response):
+    token = request.cookies.get("refresh_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No refresh token")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user_id = str(user["_id"])
+        access = create_access_token(user_id, user["email"])
+        response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=3600, path="/")
+        return {"access_token": access}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+# ── Subscription & Stripe Endpoints ─────────────────────
+
+@api_router.get("/subscription/plans")
+async def get_plans():
+    return SUBSCRIPTION_PLANS
+
+@api_router.post("/subscription/checkout")
+async def create_checkout(request: Request):
+    user = await get_current_user(request)
+    body = await request.json()
+    plan_id = body.get("plan_id", "pro")
+    origin_url = body.get("origin_url", "")
+    
+    if plan_id not in SUBSCRIPTION_PLANS or plan_id == "free":
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    
+    plan = SUBSCRIPTION_PLANS[plan_id]
+    api_key = os.environ.get("STRIPE_API_KEY")
+    
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
+    
+    success_url = f"{origin_url}/subscription?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin_url}/subscription"
+    
+    checkout_req = CheckoutSessionRequest(
+        amount=plan["price"],
+        currency="usd",
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata={
+            "user_id": user["_id"],
+            "user_email": user["email"],
+            "plan_id": plan_id,
+            "plan_name": plan["name"],
+        }
+    )
+    
+    session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_req)
+    
+    # Create payment transaction record
+    await db.payment_transactions.insert_one({
+        "session_id": session.session_id,
+        "user_id": user["_id"],
+        "user_email": user["email"],
+        "plan_id": plan_id,
+        "amount": plan["price"],
+        "currency": "usd",
+        "payment_status": "pending",
+        "created_at": datetime.now(timezone.utc),
+        "metadata": {"plan_id": plan_id, "plan_name": plan["name"]},
+    })
+    
+    return {"url": session.url, "session_id": session.session_id}
+
+@api_router.get("/subscription/status/{session_id}")
+async def check_subscription_status(session_id: str, request: Request):
+    user = await get_current_user(request)
+    
+    txn = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    
+    if txn.get("payment_status") == "paid":
+        return {"status": "complete", "payment_status": "paid", "plan_id": txn.get("plan_id")}
+    
+    api_key = os.environ.get("STRIPE_API_KEY")
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
+    
+    try:
+        status: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
+        
+        if status.payment_status == "paid":
+            existing = await db.payment_transactions.find_one({"session_id": session_id, "payment_status": "paid"})
+            if not existing:
+                plan_id = txn.get("plan_id", "pro")
+                plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["pro"])
+                
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id},
+                    {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc)}}
+                )
+                
+                expires = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+                await db.users.update_one(
+                    {"_id": ObjectId(user["_id"])},
+                    {"$set": {"subscription": plan_id, "subscription_expires": expires}}
+                )
+        
+        await db.payment_transactions.update_one(
+            {"session_id": session_id, "payment_status": {"$ne": "paid"}},
+            {"$set": {"payment_status": status.payment_status, "stripe_status": status.status}}
+        )
+        
+        return {"status": status.status, "payment_status": status.payment_status, "plan_id": txn.get("plan_id")}
+    except Exception as e:
+        logger.error(f"Stripe status check error: {e}")
+        return {"status": "pending", "payment_status": "pending", "plan_id": txn.get("plan_id")}
+
+@api_router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    try:
+        body = await request.body()
+        sig = request.headers.get("Stripe-Signature", "")
+        api_key = os.environ.get("STRIPE_API_KEY")
+        host_url = str(request.base_url).rstrip("/")
+        webhook_url = f"{host_url}/api/webhook/stripe"
+        stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
+        event = await stripe_checkout.handle_webhook(body, sig)
+        
+        if event.payment_status == "paid" and event.session_id:
+            txn = await db.payment_transactions.find_one({"session_id": event.session_id})
+            if txn and txn.get("payment_status") != "paid":
+                plan_id = event.metadata.get("plan_id", "pro")
+                plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["pro"])
+                
+                await db.payment_transactions.update_one(
+                    {"session_id": event.session_id},
+                    {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc)}}
+                )
+                
+                user_id = event.metadata.get("user_id")
+                if user_id:
+                    expires = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+                    await db.users.update_one(
+                        {"_id": ObjectId(user_id)},
+                        {"$set": {"subscription": plan_id, "subscription_expires": expires}}
+                    )
+        
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"status": "error"}
+
+# ── Contact Models & Endpoints ──────────────────────────
+
+class Contact(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    phone: str = ""
+    order: int = 1
+    is_emt: bool = False
+
+class ContactsPayload(BaseModel):
+    contacts: List[Contact]
+
+@api_router.get("/contacts", response_model=List[Contact])
+async def get_contacts(request: Request):
+    user = await get_optional_user(request)
+    query = {"user_id": user["_id"]} if user else {}
+    contacts = await db.contacts.find(query, {"_id": 0}).sort("order", 1).limit(10).to_list(10)
+    return [Contact(**c) for c in contacts]
+
+@api_router.post("/contacts")
+async def save_contacts(payload: ContactsPayload, request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    
+    # Check subscription limits
+    sub = user.get("subscription", "free") if user else "free"
+    plan = SUBSCRIPTION_PLANS.get(sub, SUBSCRIPTION_PLANS["free"])
+    max_contacts = plan["max_contacts"]
+    
+    regular_contacts = [c for c in payload.contacts if not c.is_emt]
+    if len(regular_contacts) > max_contacts:
+        # Allow saving but only the allowed number will be active
+        pass
+    
+    await db.contacts.delete_many({"user_id": user_id})
+    for contact in payload.contacts:
+        doc = contact.dict()
+        doc["user_id"] = user_id
+        await db.contacts.insert_one(doc)
+    return {"status": "saved", "count": len(payload.contacts)}
+
+@api_router.get("/contacts/default")
+async def get_default_contacts(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    
+    existing = await db.contacts.find({"user_id": user_id}, {"_id": 0}).to_list(10)
+    if existing:
+        return [Contact(**c) for c in existing]
+    
+    defaults = []
+    for i in range(1, 6):
+        defaults.append(Contact(id=str(uuid.uuid4()), name=f"Emergency Contact {i}", phone="", order=i, is_emt=False))
+    defaults.append(Contact(id=str(uuid.uuid4()), name="911 / EMT", phone="911", order=0, is_emt=True))
+    return defaults
+
+# ── Alert Models & Endpoints ────────────────────────────
+
+class AlertCreate(BaseModel):
+    gps_lat: Optional[float] = None
+    gps_lng: Optional[float] = None
+    gps_address: Optional[str] = None
+
+class AlertResponse(BaseModel):
+    id: str
+    status: str
+    gps_lat: Optional[float] = None
+    gps_lng: Optional[float] = None
+    gps_address: Optional[str] = None
+    created_at: str
+    dismissed_at: Optional[str] = None
+    dismissed_by: Optional[str] = None
+    current_call_index: int = -1
+    call_log: List[dict] = []
+    countdown_seconds: int = 180
+
+class CallStatusResponse(BaseModel):
+    alert_id: str
+    status: str
+    current_call_index: int
+    current_contact_name: str = ""
+    current_contact_phone: str = ""
+    call_log: List[dict] = []
+    someone_answered: bool = False
+
+active_call_tasks: Dict[str, asyncio.Task] = {}
+
+def get_twilio_client():
+    """Get Twilio client from environment variables."""
+    if not TWILIO_AVAILABLE:
+        return None
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if account_sid and auth_token:
+        return TwilioClient(account_sid, auth_token)
+    return None
+
+def make_twilio_call(to_number: str, gps_address: str) -> dict:
+    """Make a real Twilio voice call with 'Smoke Detected' announcement and GPS location."""
+    twilio_client = get_twilio_client()
+    from_number = os.environ.get("TWILIO_PHONE_NUMBER")
+    
+    if not twilio_client or not from_number:
+        return {"status": "failed", "error": "Twilio not configured"}
+    
+    twiml_message = (
+        f'<Response>'
+        f'<Say voice="alice" loop="3">Smoke Detected! Smoke Detected! '
+        f'This is an emergency alert from Smoke Guard. '
+        f'Smoke has been detected at location {gps_address}. '
+        f'Please respond immediately.</Say>'
+        f'<Pause length="2"/>'
+        f'<Say voice="alice">If you received this message, the caller needs immediate assistance. '
+        f'GPS coordinates: {gps_address}</Say>'
+        f'</Response>'
+    )
+    
+    try:
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=from_number,
+            twiml=twiml_message,
+            timeout=30,
+        )
+        return {"status": "initiated", "call_sid": call.sid}
+    except Exception as e:
+        logger.error(f"Twilio call failed to {to_number}: {e}")
+        return {"status": "failed", "error": str(e)}
+
+def send_twilio_sms(to_number: str, gps_address: str, gps_lat: float, gps_lng: float):
+    """Send SMS with smoke alert and GPS location."""
+    twilio_client = get_twilio_client()
+    from_number = os.environ.get("TWILIO_PHONE_NUMBER")
+    
+    if not twilio_client or not from_number:
+        return
+    
+    message_body = (
+        f"🚨 SMOKE DETECTED - Emergency Alert from Smoke Guard!\n\n"
+        f"Smoke has been detected. Immediate attention required.\n\n"
+        f"📍 GPS Location: {gps_address}\n"
+        f"🗺 Maps: https://maps.google.com/?q={gps_lat},{gps_lng}\n\n"
+        f"If the occupant does not respond, please call emergency services."
+    )
+    
+    try:
+        twilio_client.messages.create(
+            to=to_number,
+            from_=from_number,
+            body=message_body,
+        )
+        logger.info(f"SMS sent to {to_number}")
+    except Exception as e:
+        logger.error(f"Twilio SMS failed to {to_number}: {e}")
+
+async def run_call_sequence(alert_id: str):
+    """Run real Twilio call sequence - calls contacts sequentially, sends SMS with GPS."""
+    try:
+        alert_doc = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+        user_id = alert_doc.get("user_id", "anonymous") if alert_doc else "anonymous"
+        gps_address = alert_doc.get("gps_address", "Unknown location") if alert_doc else "Unknown"
+        gps_lat = alert_doc.get("gps_lat", 0) if alert_doc else 0
+        gps_lng = alert_doc.get("gps_lng", 0) if alert_doc else 0
+        
+        contacts = await db.contacts.find({"is_emt": False, "user_id": user_id}, {"_id": 0}).sort("order", 1).limit(5).to_list(5)
+        emt = await db.contacts.find_one({"is_emt": True, "user_id": user_id}, {"_id": 0})
+        all_targets = contacts + ([emt] if emt else [])
+        
+        for i, contact in enumerate(all_targets):
+            alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+            if not alert or alert.get("status") in ("dismissed", "resolved"):
+                return
+            
+            name = contact.get("name", f"Contact {i+1}")
+            phone = contact.get("phone", "")
+            is_emt_call = contact.get("is_emt", False)
+            
+            if not phone or phone == "Unknown":
+                continue
+            
+            # Update status to ringing
+            await db.alerts.update_one(
+                {"id": alert_id},
+                {"$set": {"current_call_index": i, "status": "calling"},
+                 "$push": {"call_log": {"contact_name": name, "contact_phone": phone, "is_emt": is_emt_call, "status": "ringing", "timestamp": datetime.now(timezone.utc).isoformat()}}}
+            )
+            
+            # Send SMS with GPS location
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, send_twilio_sms, phone, gps_address, gps_lat, gps_lng)
+            
+            # Make the actual call
+            call_result = await loop.run_in_executor(None, make_twilio_call, phone, gps_address)
+            
+            if call_result.get("status") == "initiated":
+                # Wait for call to be answered (poll for ~30 seconds)
+                call_sid = call_result.get("call_sid")
+                answered = False
+                
+                for _ in range(15):
+                    await asyncio.sleep(2)
+                    # Check if alert was dismissed
+                    alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+                    if not alert or alert.get("status") in ("dismissed", "resolved"):
+                        return
+                    
+                    # Check call status via Twilio
+                    try:
+                        twilio_client = get_twilio_client()
+                        if twilio_client and call_sid:
+                            call_info = twilio_client.calls(call_sid).fetch()
+                            if call_info.status in ("in-progress", "completed"):
+                                answered = True
+                                break
+                            elif call_info.status in ("canceled", "failed", "busy", "no-answer"):
+                                break
+                    except Exception as e:
+                        logger.error(f"Error checking call status: {e}")
+                
+                # Update call log with result
+                alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+                call_log = alert.get("call_log", []) if alert else []
+                if call_log:
+                    call_log[-1]["status"] = "answered" if answered else "no_answer"
+                    call_log[-1]["call_sid"] = call_sid
+                    await db.alerts.update_one({"id": alert_id}, {"$set": {"call_log": call_log}})
+                
+                if answered:
+                    # Someone answered - mark alert as resolved
+                    await db.alerts.update_one(
+                        {"id": alert_id},
+                        {"$set": {"status": "dismissed", "dismissed_by": "call_answered", "dismissed_at": datetime.now(timezone.utc).isoformat()}}
+                    )
+                    return
+            else:
+                # Call failed - mark as no_answer and continue
+                alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+                call_log = alert.get("call_log", []) if alert else []
+                if call_log:
+                    call_log[-1]["status"] = "no_answer"
+                    call_log[-1]["error"] = call_result.get("error", "")
+                    await db.alerts.update_one({"id": alert_id}, {"$set": {"call_log": call_log}})
+        
+        # All calls done with no answer - mark as resolved
+        await db.alerts.update_one({"id": alert_id}, {"$set": {"status": "resolved"}})
+    except Exception as e:
+        logger.error(f"Call sequence error for alert {alert_id}: {e}")
+    finally:
+        active_call_tasks.pop(alert_id, None)
+
+@api_router.post("/alerts", response_model=AlertResponse)
+async def create_alert(data: AlertCreate, request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    
+    await db.alerts.update_many(
+        {"status": {"$in": ["alarm", "calling"]}},
+        {"$set": {"status": "dismissed", "dismissed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    alert = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "status": "alarm",
+        "gps_lat": data.gps_lat,
+        "gps_lng": data.gps_lng,
+        "gps_address": data.gps_address,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dismissed_at": None,
+        "dismissed_by": None,
+        "current_call_index": -1,
+        "call_log": [],
+        "countdown_seconds": 180,
+    }
+    await db.alerts.insert_one(alert)
+    alert.pop("_id", None)
+    return AlertResponse(**alert)
+
+@api_router.get("/alerts/active")
+async def get_active_alert():
+    alert = await db.alerts.find_one({"status": {"$in": ["alarm", "calling"]}}, {"_id": 0})
+    if not alert:
+        return {"active": False}
+    return {"active": True, "alert": AlertResponse(**alert)}
+
+@api_router.post("/alerts/{alert_id}/dismiss")
+async def dismiss_alert(alert_id: str, dismissed_by: str = "user_button"):
+    alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    
+    await db.alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"status": "dismissed", "dismissed_at": datetime.now(timezone.utc).isoformat(), "dismissed_by": dismissed_by}}
+    )
+    task = active_call_tasks.pop(alert_id, None)
+    if task:
+        task.cancel()
+    return {"status": "dismissed", "alert_id": alert_id}
+
+@api_router.post("/alerts/{alert_id}/start-calls")
+async def start_calls(alert_id: str):
+    alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    
+    await db.alerts.update_one({"id": alert_id}, {"$set": {"status": "calling", "current_call_index": 0}})
+    task = asyncio.create_task(run_call_sequence(alert_id))
+    active_call_tasks[alert_id] = task
+    return {"status": "calling_started", "alert_id": alert_id}
+
+@api_router.get("/alerts/{alert_id}/call-status", response_model=CallStatusResponse)
+async def get_call_status(alert_id: str):
+    alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    
+    idx = alert.get("current_call_index", -1)
+    log = alert.get("call_log", [])
+    name, phone = "", ""
+    if log and idx >= 0:
+        latest = log[-1]
+        if latest.get("status") == "ringing":
+            name = latest.get("contact_name", "")
+            phone = latest.get("contact_phone", "")
+    
+    return CallStatusResponse(
+        alert_id=alert_id, status=alert.get("status", "unknown"),
+        current_call_index=idx, current_contact_name=name, current_contact_phone=phone,
+        call_log=log, someone_answered=alert.get("dismissed_by") == "call_answered"
+    )
+
+@api_router.post("/alerts/{alert_id}/simulate-answer")
+async def simulate_answer(alert_id: str):
+    alert = await db.alerts.find_one({"id": alert_id}, {"_id": 0})
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    
+    log = alert.get("call_log", [])
+    if log:
+        log[-1]["status"] = "answered"
+    
+    await db.alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"status": "dismissed", "dismissed_by": "call_answered", "dismissed_at": datetime.now(timezone.utc).isoformat(), "call_log": log}}
+    )
+    task = active_call_tasks.pop(alert_id, None)
+    if task:
+        task.cancel()
+    return {"status": "answered", "alert_id": alert_id}
+
+# ── Analytics Endpoints ─────────────────────────────────
+
+@api_router.get("/analytics/history")
+async def get_alert_history(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    
+    alerts = await db.alerts.find(
+        {"user_id": user_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+    
+    return {"alerts": alerts, "total": len(alerts)}
+
+@api_router.get("/analytics/stats")
+async def get_stats(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    
+    total = await db.alerts.count_documents({"user_id": user_id})
+    dismissed = await db.alerts.count_documents({"user_id": user_id, "dismissed_by": "user_button"})
+    call_answered = await db.alerts.count_documents({"user_id": user_id, "dismissed_by": "call_answered"})
+    
+    # Last 7 days
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    recent = await db.alerts.count_documents({
+        "user_id": user_id,
+        "created_at": {"$gte": week_ago.isoformat()}
+    })
+    
+    return {
+        "total_alerts": total,
+        "dismissed_by_user": dismissed,
+        "dismissed_by_call": call_answered,
+        "alerts_last_7_days": recent,
+        "subscription": user.get("subscription", "free") if user else "free",
+    }
+
+# ── Health ──────────────────────────────────────────────
+
+@api_router.get("/")
+async def root():
+    return {"message": "Smoke Guard API", "status": "running"}
+
+@api_router.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+# ── App Setup ───────────────────────────────────────────
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Serve Static Frontend (for Railway / production) ────
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+static_dir = ROOT_DIR / "static"
+if static_dir.exists():
+    # Serve static assets (JS, CSS, images)
+    app.mount("/_expo", StaticFiles(directory=str(static_dir / "_expo")), name="expo_static")
+    app.mount("/assets", StaticFiles(directory=str(static_dir / "assets")), name="assets_static")
+    
+    # Serve favicon
+    @app.get("/favicon.ico")
+    async def favicon():
+        fav = static_dir / "favicon.ico"
+        if fav.exists():
+            return FileResponse(str(fav))
+        return Response(status_code=404)
+    
+    # Catch-all route: serve HTML pages for frontend routes
+    @app.get("/{path:path}")
+    async def serve_frontend(path: str):
+        # Skip API routes
+        if path.startswith("api"):
+            raise HTTPException(status_code=404, detail="Not found")
+        
+        # Try exact HTML file (e.g., /landing → landing.html)
+        html_file = static_dir / f"{path}.html"
+        if html_file.exists():
+            return FileResponse(str(html_file), media_type="text/html")
+        
+        # Try path as directory with index.html
+        index_file = static_dir / path / "index.html"
+        if index_file.exists():
+            return FileResponse(str(index_file), media_type="text/html")
+        
+        # Try exact file (for any static file)
+        exact_file = static_dir / path
+        if exact_file.exists() and exact_file.is_file():
+            return FileResponse(str(exact_file))
+        
+        # Default: serve landing page for root, index.html for everything else
+        if path == "" or path == "/":
+            landing = static_dir / "landing.html"
+            if landing.exists():
+                return FileResponse(str(landing), media_type="text/html")
+        
+        # Fallback to index.html (SPA routing)
+        fallback = static_dir / "index.html"
+        if fallback.exists():
+            return FileResponse(str(fallback), media_type="text/html")
+        
+        raise HTTPException(status_code=404, detail="Not found")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup():
+    try:
+        await db.users.create_index("email", unique=True)
+        await db.login_attempts.create_index("identifier")
+        
+        # Seed admin
+        admin_email = os.environ.get("ADMIN_EMAIL", "admin@smokeguard.com")
+        admin_password = os.environ.get("ADMIN_PASSWORD", "SmokeSafe2024!")
+        existing = await db.users.find_one({"email": admin_email})
+        if not existing:
+            await db.users.insert_one({
+                "email": admin_email,
+                "password_hash": hash_password(admin_password),
+                "name": "Admin",
+                "role": "admin",
+                "subscription": "pro",
+                "subscription_expires": datetime.now(timezone.utc) + timedelta(days=365),
+                "created_at": datetime.now(timezone.utc),
+            })
+            logger.info(f"Admin seeded: {admin_email}")
+        elif not verify_password(admin_password, existing["password_hash"]):
+            await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
+            logger.info("Admin password updated")
+    except Exception as e:
+        logger.error(f"Startup error (non-fatal): {e}")
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
