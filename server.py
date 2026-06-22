@@ -506,6 +506,234 @@ class Contact(BaseModel):
 class ContactsPayload(BaseModel):
     contacts: List[Contact]
 
+# ── Satellite Device Endpoints ──────────────────────────
+
+class SatelliteRegister(BaseModel):
+    name: str = "Home Smoke Detector"
+    home_address: str = ""
+    home_gps_lat: float = 0
+    home_gps_lng: float = 0
+    owner_phone: str = ""
+    custom_message: str = ""
+
+class SatelliteAlarmTrigger(BaseModel):
+    device_id: str
+    sound_level: float = 0
+
+@api_router.post("/satellite/register")
+async def register_satellite(data: SatelliteRegister, request: Request):
+    """Register a satellite device and link it to the owner's account."""
+    user = await get_current_user(request)
+    
+    device_id = str(uuid.uuid4())[:8].upper()
+    device_code = f"SAT-{device_id}"
+    
+    custom_msg = data.custom_message or f"This is an emergency alert from THE FIRE APP. The smoke alarm at {data.home_address or 'your home'} has detected smoke. Please investigate immediately."
+    
+    device = {
+        "device_id": device_code,
+        "user_id": user["_id"],
+        "owner_email": user["email"],
+        "owner_phone": data.owner_phone,
+        "name": data.name,
+        "home_address": data.home_address,
+        "home_gps_lat": data.home_gps_lat,
+        "home_gps_lng": data.home_gps_lng,
+        "custom_message": custom_msg,
+        "status": "online",
+        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "alarm_count": 0,
+    }
+    
+    await db.satellites.insert_one(device)
+    device.pop("_id", None)
+    return device
+
+@api_router.get("/satellite/devices")
+async def get_satellite_devices(request: Request):
+    """Get all satellite devices for the current user."""
+    user = await get_current_user(request)
+    devices = await db.satellites.find({"user_id": user["_id"]}, {"_id": 0}).to_list(20)
+    return {"devices": devices, "total": len(devices)}
+
+@api_router.put("/satellite/{device_id}")
+async def update_satellite(device_id: str, request: Request):
+    """Update satellite device settings."""
+    user = await get_current_user(request)
+    body = await request.json()
+    
+    device = await db.satellites.find_one({"device_id": device_id, "user_id": user["_id"]})
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    update_fields = {}
+    for field in ["name", "home_address", "home_gps_lat", "home_gps_lng", "owner_phone", "custom_message"]:
+        if field in body:
+            update_fields[field] = body[field]
+    
+    if update_fields:
+        await db.satellites.update_one({"device_id": device_id}, {"$set": update_fields})
+    
+    updated = await db.satellites.find_one({"device_id": device_id}, {"_id": 0})
+    return updated
+
+@api_router.delete("/satellite/{device_id}")
+async def delete_satellite(device_id: str, request: Request):
+    """Delete a satellite device."""
+    user = await get_current_user(request)
+    result = await db.satellites.delete_one({"device_id": device_id, "user_id": user["_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"status": "deleted", "device_id": device_id}
+
+@api_router.post("/satellite/heartbeat/{device_id}")
+async def satellite_heartbeat(device_id: str):
+    """Satellite device sends heartbeat to confirm it's online."""
+    await db.satellites.update_one(
+        {"device_id": device_id},
+        {"$set": {"status": "online", "last_heartbeat": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"status": "ok"}
+
+@api_router.post("/satellite/alarm")
+async def satellite_alarm_triggered(data: SatelliteAlarmTrigger):
+    """Called when satellite device detects smoke alarm sound. Triggers calls to owner."""
+    device = await db.satellites.find_one({"device_id": data.device_id}, {"_id": 0})
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    owner_phone = device.get("owner_phone", "")
+    custom_message = device.get("custom_message", "Smoke alarm detected at your home!")
+    home_address = device.get("home_address", "Unknown location")
+    home_lat = device.get("home_gps_lat", 0)
+    home_lng = device.get("home_gps_lng", 0)
+    device_name = device.get("name", "Satellite Device")
+    
+    # Update device status
+    await db.satellites.update_one(
+        {"device_id": data.device_id},
+        {"$set": {"status": "alarm", "last_alarm": datetime.now(timezone.utc).isoformat()},
+         "$inc": {"alarm_count": 1}}
+    )
+    
+    # Log the alarm event
+    alarm_event = {
+        "id": str(uuid.uuid4()),
+        "device_id": data.device_id,
+        "device_name": device_name,
+        "user_id": device.get("user_id"),
+        "type": "satellite_alarm",
+        "home_address": home_address,
+        "home_gps_lat": home_lat,
+        "home_gps_lng": home_lng,
+        "sound_level": data.sound_level,
+        "status": "triggered",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "call_status": "pending",
+    }
+    await db.satellite_alarms.insert_one(alarm_event)
+    alarm_event.pop("_id", None)
+    
+    # Make Twilio call to owner with custom message
+    if owner_phone:
+        loop = asyncio.get_event_loop()
+        
+        # Build TwiML with owner's custom message
+        twiml_message = (
+            f'<Response>'
+            f'<Say voice="alice" loop="3">{custom_message} '
+            f'Location: {home_address}. '
+            f'Please investigate immediately.</Say>'
+            f'<Pause length="2"/>'
+            f'<Say voice="alice">GPS coordinates: {home_lat}, {home_lng}. '
+            f'Open your Fire App for more details.</Say>'
+            f'</Response>'
+        )
+        
+        try:
+            twilio_client = get_twilio_client()
+            from_number = os.environ.get("TWILIO_PHONE_NUMBER")
+            if twilio_client and from_number:
+                call = twilio_client.calls.create(
+                    to=owner_phone,
+                    from_=from_number,
+                    twiml=twiml_message,
+                    timeout=30,
+                )
+                await db.satellite_alarms.update_one(
+                    {"id": alarm_event["id"]},
+                    {"$set": {"call_status": "initiated", "call_sid": call.sid}}
+                )
+                
+                # Also send SMS
+                maps_link = f"https://maps.google.com/?q={home_lat},{home_lng}"
+                sms_body = (
+                    f"🚨 SATELLITE ALARM - {device_name}\n\n"
+                    f"{custom_message}\n\n"
+                    f"📍 Location: {home_address}\n"
+                    f"🗺 Map: {maps_link}\n\n"
+                    f"Open THE FIRE APP for details."
+                )
+                twilio_client.messages.create(
+                    to=owner_phone,
+                    from_=from_number,
+                    body=sms_body,
+                )
+        except Exception as e:
+            logger.error(f"Satellite alarm call failed: {e}")
+            await db.satellite_alarms.update_one(
+                {"id": alarm_event["id"]},
+                {"$set": {"call_status": "failed", "error": str(e)}}
+            )
+    
+    # Also call emergency contacts if user has them
+    user_id = device.get("user_id")
+    if user_id:
+        contacts = await db.contacts.find({"user_id": user_id, "is_emt": False}, {"_id": 0}).sort("order", 1).limit(5).to_list(5)
+        for contact in contacts:
+            contact_phone = contact.get("phone")
+            if contact_phone:
+                try:
+                    twilio_client = get_twilio_client()
+                    from_number = os.environ.get("TWILIO_PHONE_NUMBER")
+                    if twilio_client and from_number:
+                        twilio_client.messages.create(
+                            to=contact_phone,
+                            from_=from_number,
+                            body=f"🚨 FIRE ALERT from THE FIRE APP\n\n{custom_message}\n\n📍 {home_address}\n🗺 https://maps.google.com/?q={home_lat},{home_lng}",
+                        )
+                except Exception as e:
+                    logger.error(f"Contact SMS failed: {e}")
+    
+    return alarm_event
+
+@api_router.post("/satellite/alarm/{device_id}/dismiss")
+async def dismiss_satellite_alarm(device_id: str, request: Request):
+    """Owner dismisses the satellite alarm."""
+    user = await get_current_user(request)
+    
+    await db.satellites.update_one(
+        {"device_id": device_id, "user_id": user["_id"]},
+        {"$set": {"status": "online"}}
+    )
+    
+    await db.satellite_alarms.update_many(
+        {"device_id": device_id, "status": "triggered"},
+        {"$set": {"status": "dismissed", "dismissed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    return {"status": "dismissed"}
+
+@api_router.get("/satellite/alarms")
+async def get_satellite_alarms(request: Request):
+    """Get alarm history for satellite devices."""
+    user = await get_current_user(request)
+    alarms = await db.satellite_alarms.find(
+        {"user_id": user["_id"]}, {"_id": 0}
+    ).sort("created_at", -1).limit(50).to_list(50)
+    return {"alarms": alarms, "total": len(alarms)}
+
 @api_router.get("/contacts", response_model=List[Contact])
 async def get_contacts(request: Request):
     user = await get_optional_user(request)
