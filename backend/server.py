@@ -42,11 +42,12 @@ JWT_ALGORITHM = "HS256"
 # ── Subscription Plans ──────────────────────────────────
 
 SUBSCRIPTION_PLANS = {
-    "free": {"name": "Free", "price": 0.0, "max_contacts": 1, "features": ["Basic smoke detection", "1 emergency contact", "Local alarm only"], "duration_days": 0, "includes_satellite": False},
-    "pro": {"name": "Pro", "price": 3.99, "max_contacts": 5, "features": ["5 contacts + EMT auto-dial", "GPS sharing", "Call history", "Priority alerts"], "duration_days": 30, "includes_satellite": False},
-    "satellite": {"name": "Satellite", "price": 2.99, "max_contacts": 1, "features": ["1 Satellite device", "Custom voice alert message", "Auto-call owner when alarm sounds", "SMS with GPS location to owner"], "duration_days": 30, "includes_satellite": True},
-    "pro_satellite": {"name": "Pro + Satellite", "price": 6.98, "max_contacts": 5, "features": ["Everything in Pro", "1 Satellite device included", "Custom voice alert message", "Auto-call + SMS on alarm", "Best value — save $0.00"], "duration_days": 30, "includes_satellite": True},
-    "family": {"name": "Family", "price": 7.99, "max_contacts": 5, "features": ["Multi-device sync (5 phones)", "SMS alerts to family", "Cloud alert logs", "All Pro features", "1 Satellite device included"], "duration_days": 30, "includes_satellite": True},
+    "free": {"name": "Free", "price": 0.0, "max_contacts": 1, "features": ["Basic smoke detection", "1 emergency contact", "Local alarm only"], "duration_days": 0, "includes_satellite": False, "satellite_count": 0},
+    "pro": {"name": "Pro", "price": 3.99, "max_contacts": 5, "features": ["5 contacts + EMT auto-dial", "GPS sharing", "Call history", "Priority alerts"], "duration_days": 30, "includes_satellite": False, "satellite_count": 0},
+    "satellite": {"name": "Satellite", "price": 2.99, "max_contacts": 1, "features": ["1 Satellite device", "Custom voice alert message", "Auto-call owner when alarm sounds", "SMS with GPS location to owner"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
+    "pro_satellite": {"name": "Pro + Satellite", "price": 6.98, "max_contacts": 5, "features": ["Everything in Pro", "1 Satellite device included", "Custom voice alert message", "Auto-call + SMS on alarm", "Best value bundle"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
+    "extra_satellite": {"name": "Extra Satellite", "price": 1.99, "max_contacts": 0, "features": ["Add 1 more Satellite device", "Monitor an extra room or area", "Same custom voice + auto-call", "Stack multiple for whole-home coverage"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1, "is_addon": True},
+    "family": {"name": "Family", "price": 7.99, "max_contacts": 5, "features": ["Multi-device sync (5 phones)", "SMS alerts to family", "Cloud alert logs", "All Pro features", "1 Satellite device included"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
 }
 
 # ── Password Helpers ────────────────────────────────────
