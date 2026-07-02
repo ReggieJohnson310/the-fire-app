@@ -48,6 +48,9 @@ SUBSCRIPTION_PLANS = {
     "pro_satellite": {"name": "Pro + Satellite", "price": 6.98, "max_contacts": 5, "features": ["Everything in Pro", "1 Satellite device included", "Custom voice alert message", "Auto-call + SMS on alarm", "Best value bundle"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
     "extra_satellite": {"name": "Extra Satellite", "price": 1.99, "max_contacts": 0, "features": ["Add 1 more Satellite device", "Monitor an extra room or area", "Same custom voice + auto-call", "Stack multiple for whole-home coverage"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1, "is_addon": True},
     "family": {"name": "Family", "price": 7.99, "max_contacts": 5, "features": ["Multi-device sync (5 phones)", "SMS alerts to family", "Cloud alert logs", "All Pro features", "1 Satellite device included"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
+    "pro_yearly": {"name": "Pro Yearly", "price": 33.50, "max_contacts": 5, "features": ["Everything in Pro", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": False, "satellite_count": 0, "billing": "yearly"},
+    "pro_satellite_yearly": {"name": "Pro + Satellite Yearly", "price": 58.63, "max_contacts": 5, "features": ["Everything in Pro + Satellite", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": True, "satellite_count": 1, "billing": "yearly"},
+    "family_yearly": {"name": "Family Yearly", "price": 67.11, "max_contacts": 5, "features": ["Everything in Family", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": True, "satellite_count": 1, "billing": "yearly"},
 }
 
 # ── Password Helpers ────────────────────────────────────
@@ -265,12 +268,14 @@ async def ensure_stripe_products():
                 description=", ".join(plan["features"]),
             )
             
-            # Create recurring price
+            # Create recurring price (monthly or yearly)
+            billing = plan.get("billing", "monthly")
+            interval = "year" if billing == "yearly" else "month"
             price = stripe.Price.create(
                 product=product.id,
                 unit_amount=int(plan["price"] * 100),
                 currency="usd",
-                recurring={"interval": "month"},
+                recurring={"interval": interval},
             )
             
             STRIPE_PRICES[plan_id] = price.id
