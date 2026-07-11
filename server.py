@@ -848,6 +848,36 @@ async def get_heat_alerts(request: Request):
     ).sort("created_at", -1).limit(50).to_list(50)
     return {"alerts": alerts, "total": len(alerts)}
 
+# ── Camera Sensitivity Settings ─────────────────────────
+
+class CameraSettings(BaseModel):
+    smoke_sensitivity: int = 50
+    heat_sensitivity: int = 50
+    motion_sensitivity: int = 50
+    night_mode: bool = False
+    scan_interval: int = 3
+
+@api_router.get("/camera/settings")
+async def get_camera_settings(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    settings = await db.camera_settings.find_one({"user_id": user_id}, {"_id": 0})
+    if not settings:
+        return CameraSettings().dict()
+    settings.pop("user_id", None)
+    return settings
+
+@api_router.post("/camera/settings")
+async def save_camera_settings(data: CameraSettings, request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    doc = data.dict()
+    doc["user_id"] = user_id
+    await db.camera_settings.update_one(
+        {"user_id": user_id}, {"$set": doc}, upsert=True
+    )
+    return {"status": "saved"}
+
 @api_router.get("/contacts", response_model=List[Contact])
 async def get_contacts(request: Request):
     user = await get_optional_user(request)
