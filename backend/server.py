@@ -742,6 +742,112 @@ async def get_satellite_alarms(request: Request):
     ).sort("created_at", -1).limit(50).to_list(50)
     return {"alarms": alarms, "total": len(alarms)}
 
+# ── Heat Detection Settings & Endpoints ─────────────────
+
+class HeatSettings(BaseModel):
+    enabled: bool = True
+    threshold_f: float = 100.0  # Fahrenheit
+    heat_sensitivity: int = 50  # 0-100 camera sensitivity
+    warning_enabled: bool = True
+    full_alarm_on_rising: bool = True
+
+@api_router.get("/heat/settings")
+async def get_heat_settings(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    settings = await db.heat_settings.find_one({"user_id": user_id}, {"_id": 0})
+    if not settings:
+        return HeatSettings().dict()
+    settings.pop("user_id", None)
+    return settings
+
+@api_router.post("/heat/settings")
+async def save_heat_settings(data: HeatSettings, request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    doc = data.dict()
+    doc["user_id"] = user_id
+    await db.heat_settings.update_one(
+        {"user_id": user_id}, {"$set": doc}, upsert=True
+    )
+    return {"status": "saved"}
+
+@api_router.post("/heat/alert")
+async def create_heat_alert(request: Request):
+    """Create a heat alert — warning or full alarm based on severity."""
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    body = await request.json()
+    
+    heat_score = body.get("heat_score", 0)
+    heat_level = body.get("heat_level", "warning")  # "warning" or "critical"
+    gps_lat = body.get("gps_lat", 0)
+    gps_lng = body.get("gps_lng", 0)
+    gps_address = body.get("gps_address", "Unknown")
+    source = body.get("source", "camera")  # "camera", "barometer", "satellite"
+    device_id = body.get("device_id", None)
+    
+    alert = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "type": "heat",
+        "heat_score": heat_score,
+        "heat_level": heat_level,
+        "source": source,
+        "device_id": device_id,
+        "gps_lat": gps_lat,
+        "gps_lng": gps_lng,
+        "gps_address": gps_address,
+        "status": "active",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dismissed_at": None,
+    }
+    await db.heat_alerts.insert_one(alert)
+    alert.pop("_id", None)
+    
+    # If critical — trigger full alarm flow (call contacts)
+    if heat_level == "critical":
+        # Create a regular alert for the calling system
+        smoke_alert = {
+            "id": alert["id"],
+            "user_id": user_id,
+            "status": "alarm",
+            "gps_lat": gps_lat,
+            "gps_lng": gps_lng,
+            "gps_address": gps_address,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "dismissed_at": None,
+            "dismissed_by": None,
+            "current_call_index": -1,
+            "call_log": [],
+            "countdown_seconds": 180,
+            "alert_type": "heat",
+        }
+        await db.alerts.insert_one(smoke_alert)
+    
+    return alert
+
+@api_router.post("/heat/alert/{alert_id}/dismiss")
+async def dismiss_heat_alert(alert_id: str, request: Request):
+    await db.heat_alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"status": "dismissed", "dismissed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    await db.alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"status": "dismissed", "dismissed_at": datetime.now(timezone.utc).isoformat(), "dismissed_by": "user_button"}}
+    )
+    return {"status": "dismissed"}
+
+@api_router.get("/heat/alerts")
+async def get_heat_alerts(request: Request):
+    user = await get_optional_user(request)
+    user_id = user["_id"] if user else "anonymous"
+    alerts = await db.heat_alerts.find(
+        {"user_id": user_id}, {"_id": 0}
+    ).sort("created_at", -1).limit(50).to_list(50)
+    return {"alerts": alerts, "total": len(alerts)}
+
 @api_router.get("/contacts", response_model=List[Contact])
 async def get_contacts(request: Request):
     user = await get_optional_user(request)
