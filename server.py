@@ -43,14 +43,11 @@ JWT_ALGORITHM = "HS256"
 
 SUBSCRIPTION_PLANS = {
     "free": {"name": "Free", "price": 0.0, "max_contacts": 1, "features": ["Basic smoke detection", "1 emergency contact", "Local alarm only"], "duration_days": 0, "includes_satellite": False, "satellite_count": 0},
-    "pro": {"name": "Pro", "price": 3.99, "max_contacts": 5, "features": ["5 contacts + EMT auto-dial", "GPS sharing", "Call history", "Priority alerts"], "duration_days": 30, "includes_satellite": False, "satellite_count": 0},
-    "satellite": {"name": "Satellite", "price": 2.99, "max_contacts": 1, "features": ["1 Satellite device", "Custom voice alert message", "Auto-call owner when alarm sounds", "SMS with GPS location to owner"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
-    "pro_satellite": {"name": "Pro + Satellite", "price": 6.98, "max_contacts": 5, "features": ["Everything in Pro", "1 Satellite device included", "Custom voice alert message", "Auto-call + SMS on alarm", "Best value bundle"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
+    "tier1": {"name": "Tier One", "price": 3.99, "max_contacts": 1, "features": ["Camera sensitive fire detection", "Auto-dials EMT", "Gives GPS location", "Alert sent from 1 leader phone", "Alert sent to 1 family contact"], "duration_days": 30, "includes_satellite": False, "satellite_count": 0},
+    "tier2": {"name": "Tier Two", "price": 7.99, "max_contacts": 5, "features": ["Camera sensitive fire detection", "Carbon monoxide detection", "Auto-dials EMT", "Gives GPS location", "Alerts sent from 5 leader phones", "Alerts sent to 5 family contacts per phone"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
+    "tier1_yearly": {"name": "Tier One Yearly", "price": 33.50, "max_contacts": 1, "features": ["Everything in Tier One", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": False, "satellite_count": 0, "billing": "yearly"},
+    "tier2_yearly": {"name": "Tier Two Yearly", "price": 67.11, "max_contacts": 5, "features": ["Everything in Tier Two", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": True, "satellite_count": 1, "billing": "yearly"},
     "extra_satellite": {"name": "Extra Satellite", "price": 1.99, "max_contacts": 0, "features": ["Add 1 more Satellite device", "Monitor an extra room or area", "Same custom voice + auto-call", "Stack multiple for whole-home coverage"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1, "is_addon": True},
-    "family": {"name": "Family", "price": 7.99, "max_contacts": 5, "features": ["Multi-device sync (5 phones)", "SMS alerts to family", "Cloud alert logs", "All Pro features", "1 Satellite device included"], "duration_days": 30, "includes_satellite": True, "satellite_count": 1},
-    "pro_yearly": {"name": "Pro Yearly", "price": 33.50, "max_contacts": 5, "features": ["Everything in Pro", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": False, "satellite_count": 0, "billing": "yearly"},
-    "pro_satellite_yearly": {"name": "Pro + Satellite Yearly", "price": 58.63, "max_contacts": 5, "features": ["Everything in Pro + Satellite", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": True, "satellite_count": 1, "billing": "yearly"},
-    "family_yearly": {"name": "Family Yearly", "price": 67.11, "max_contacts": 5, "features": ["Everything in Family", "Save 30% vs monthly", "Billed annually"], "duration_days": 365, "includes_satellite": True, "satellite_count": 1, "billing": "yearly"},
 }
 
 # ── Password Helpers ────────────────────────────────────
