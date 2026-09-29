@@ -971,7 +971,7 @@ def make_twilio_call(to_number: str, gps_address: str) -> dict:
     twiml_message = (
         f'<Response>'
         f'<Say voice="alice" loop="3">Smoke Detected! Smoke Detected! '
-        f'This is an emergency alert from Smoke Guard. '
+        f'This is an emergency alert from THE FIRE APP. '
         f'Smoke has been detected at location {gps_address}. '
         f'Please respond immediately.</Say>'
         f'<Pause length="2"/>'
@@ -1001,7 +1001,7 @@ def send_twilio_sms(to_number: str, gps_address: str, gps_lat: float, gps_lng: f
         return
     
     message_body = (
-        f"🚨 SMOKE DETECTED - Emergency Alert from Smoke Guard!\n\n"
+        f"🚨 SMOKE DETECTED - Emergency Alert from THE FIRE APP!\n\n"
         f"Smoke has been detected. Immediate attention required.\n\n"
         f"📍 GPS Location: {gps_address}\n"
         f"🗺 Maps: https://maps.google.com/?q={gps_lat},{gps_lng}\n\n"
@@ -1255,7 +1255,7 @@ async def get_stats(request: Request):
 
 @api_router.get("/")
 async def root():
-    return {"message": "Smoke Guard API", "status": "running"}
+    return {"message": "THE FIRE APP API", "status": "running"}
 
 @api_router.get("/health")
 async def health():
