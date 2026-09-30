@@ -22,12 +22,38 @@ from emergentintegrations.payments.stripe.checkout import (
     StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 )
 import stripe
+import httpx
 try:
     from twilio.rest import Client as TwilioClient
     TWILIO_AVAILABLE = True
 except ImportError:
     TwilioClient = None
     TWILIO_AVAILABLE = False
+
+# Authorize.net config
+ANET_LOGIN = os.environ.get("AUTHORIZE_API_LOGIN_ID", "")
+ANET_TX_KEY = os.environ.get("AUTHORIZE_TRANSACTION_KEY", "")
+ANET_API_URL = os.environ.get("AUTHORIZE_API_URL", "https://api.authorize.net/xml/v1/request.api")
+ANET_ACCEPT_URL = os.environ.get("AUTHORIZE_ACCEPT_URL", "https://accept.authorize.net/payment/payment")
+
+def anet_auth():
+    return {"name": ANET_LOGIN, "transactionKey": ANET_TX_KEY}
+
+async def anet_request(body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(ANET_API_URL, json=body)
+        r.raise_for_status()
+        text = r.text
+        # Authorize.net returns JSON with BOM, strip it
+        if text.startswith('\ufeff'):
+            text = text[1:]
+        import json as json_mod
+        data = json_mod.loads(text)
+    msg = data.get("messages", {})
+    if msg.get("resultCode") != "Ok":
+        logger.error(f"Authorize.net error: {msg}")
+        raise HTTPException(502, {"provider": msg})
+    return data
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
@@ -237,53 +263,7 @@ async def refresh_token(request: Request, response: Response):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-# ── Subscription & Stripe Endpoints ─────────────────────
-
-# Initialize Stripe
-stripe.api_key = os.environ.get("STRIPE_API_KEY")
-
-# Store Stripe Price IDs after creation
-STRIPE_PRICES = {}
-
-async def ensure_stripe_products():
-    """Create Stripe products and recurring prices on startup."""
-    global STRIPE_PRICES
-    try:
-        for plan_id, plan in SUBSCRIPTION_PLANS.items():
-            if plan_id == "free" or plan["price"] == 0:
-                continue
-            
-            # Check if we already stored the price ID
-            existing = await db.stripe_config.find_one({"plan_id": plan_id}, {"_id": 0})
-            if existing and existing.get("price_id"):
-                STRIPE_PRICES[plan_id] = existing["price_id"]
-                continue
-            
-            # Create product
-            product = stripe.Product.create(
-                name=f"THE FIRE APP - {plan['name']} Plan",
-                description=", ".join(plan["features"]),
-            )
-            
-            # Create recurring price (monthly or yearly)
-            billing = plan.get("billing", "monthly")
-            interval = "year" if billing == "yearly" else "month"
-            price = stripe.Price.create(
-                product=product.id,
-                unit_amount=int(plan["price"] * 100),
-                currency="usd",
-                recurring={"interval": interval},
-            )
-            
-            STRIPE_PRICES[plan_id] = price.id
-            await db.stripe_config.update_one(
-                {"plan_id": plan_id},
-                {"$set": {"plan_id": plan_id, "product_id": product.id, "price_id": price.id}},
-                upsert=True
-            )
-            logger.info(f"Created Stripe product for {plan_id}: {price.id}")
-    except Exception as e:
-        logger.error(f"Stripe product setup error (non-fatal): {e}")
+# ── Subscription & Authorize.net Endpoints ──────────────
 
 @api_router.get("/subscription/plans")
 async def get_plans():
@@ -291,212 +271,138 @@ async def get_plans():
 
 @api_router.post("/subscription/checkout")
 async def create_checkout(request: Request):
+    """Create Authorize.net hosted payment page token."""
     user = await get_current_user(request)
     body = await request.json()
-    plan_id = body.get("plan_id", "pro")
+    plan_id = body.get("plan_id", "tier1")
     origin_url = body.get("origin_url", "")
     
     if plan_id not in SUBSCRIPTION_PLANS or plan_id == "free":
         raise HTTPException(status_code=400, detail="Invalid plan")
     
-    price_id = STRIPE_PRICES.get(plan_id)
-    if not price_id:
-        raise HTTPException(status_code=400, detail="Plan not available yet. Please try again.")
+    plan = SUBSCRIPTION_PLANS[plan_id]
+    amount = f"{plan['price']:.2f}"
     
     try:
-        # Get or create Stripe customer
-        stripe_customer_id = None
-        user_doc = await db.users.find_one({"_id": ObjectId(user["_id"])})
-        if user_doc and user_doc.get("stripe_customer_id"):
-            stripe_customer_id = user_doc["stripe_customer_id"]
-        else:
-            customer = stripe.Customer.create(
-                email=user["email"],
-                name=user.get("name", ""),
-                metadata={"user_id": user["_id"]},
-            )
-            stripe_customer_id = customer.id
-            await db.users.update_one(
-                {"_id": ObjectId(user["_id"])},
-                {"$set": {"stripe_customer_id": stripe_customer_id}}
-            )
+        import json as json_mod
+        anet_body = {"getHostedPaymentPageRequest": {
+            "merchantAuthentication": anet_auth(),
+            "transactionRequest": {
+                "transactionType": "authCaptureTransaction",
+                "amount": amount,
+                "customer": {"email": user["email"]},
+            },
+            "hostedPaymentSettings": {"setting": [
+                {"settingName": "hostedPaymentReturnOptions", "settingValue": json_mod.dumps({
+                    "showReceipt": True,
+                    "url": f"{origin_url}/subscription?plan_id={plan_id}&status=success",
+                    "urlText": "Return to THE FIRE APP",
+                    "cancelUrl": f"{origin_url}/subscription"
+                })},
+                {"settingName": "hostedPaymentPaymentOptions", "settingValue": json_mod.dumps({
+                    "cardCodeRequired": True, "showCreditCard": True, "showBankAccount": False
+                })},
+                {"settingName": "hostedPaymentCustomerOptions", "settingValue": json_mod.dumps({
+                    "showEmail": True, "requiredEmail": True
+                })},
+                {"settingName": "hostedPaymentOrderOptions", "settingValue": json_mod.dumps({
+                    "show": True, "merchantName": "THE FIRE APP"
+                })},
+            ]}
+        }}
         
-        success_url = f"{origin_url}/subscription?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{origin_url}/subscription"
-        
-        # Create subscription checkout session
-        session = stripe.checkout.Session.create(
-            customer=stripe_customer_id,
-            payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            mode="subscription",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={"user_id": user["_id"], "plan_id": plan_id},
-        )
+        result = await anet_request(anet_body)
+        token = result.get("token", "")
         
         # Record transaction
         await db.payment_transactions.insert_one({
-            "session_id": session.id,
+            "token": token,
             "user_id": user["_id"],
             "user_email": user["email"],
             "plan_id": plan_id,
-            "amount": SUBSCRIPTION_PLANS[plan_id]["price"],
+            "amount": plan["price"],
             "currency": "usd",
             "payment_status": "pending",
-            "subscription_mode": "recurring",
+            "payment_processor": "authorize_net",
             "created_at": datetime.now(timezone.utc),
         })
         
-        return {"url": session.url, "session_id": session.id}
+        return {"token": token, "acceptUrl": ANET_ACCEPT_URL, "plan_id": plan_id}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Checkout error: {e}")
+        logger.error(f"Authorize.net checkout error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @api_router.get("/subscription/status/{session_id}")
 async def check_subscription_status(session_id: str, request: Request):
     user = await get_current_user(request)
-    
-    txn = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    txn = await db.payment_transactions.find_one({"token": session_id}, {"_id": 0})
+    if not txn:
+        txn = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    
-    if txn.get("payment_status") == "paid":
-        return {"status": "complete", "payment_status": "paid", "plan_id": txn.get("plan_id")}
-    
-    try:
-        session = stripe.checkout.Session.retrieve(session_id)
-        
-        if session.payment_status == "paid":
-            existing = await db.payment_transactions.find_one({"session_id": session_id, "payment_status": "paid"})
-            if not existing:
-                plan_id = txn.get("plan_id", "pro")
-                
-                await db.payment_transactions.update_one(
-                    {"session_id": session_id},
-                    {"$set": {
-                        "payment_status": "paid",
-                        "stripe_subscription_id": session.subscription,
-                        "paid_at": datetime.now(timezone.utc)
-                    }}
-                )
-                
-                await db.users.update_one(
-                    {"_id": ObjectId(user["_id"])},
-                    {"$set": {
-                        "subscription": plan_id,
-                        "stripe_subscription_id": session.subscription,
-                        "subscription_status": "active",
-                    }}
-                )
-        
-        return {"status": session.status, "payment_status": session.payment_status, "plan_id": txn.get("plan_id")}
-    except Exception as e:
-        logger.error(f"Status check error: {e}")
-        return {"status": "pending", "payment_status": "pending", "plan_id": txn.get("plan_id")}
+    return {"status": txn.get("payment_status", "pending"), "payment_status": txn.get("payment_status", "pending"), "plan_id": txn.get("plan_id")}
 
-@api_router.get("/subscription/manage")
-async def get_customer_portal(request: Request):
-    """Get Stripe Customer Portal URL for managing subscription."""
+@api_router.post("/subscription/activate")
+async def activate_subscription(request: Request):
+    """Called after successful Authorize.net payment to activate the subscription."""
     user = await get_current_user(request)
-    user_doc = await db.users.find_one({"_id": ObjectId(user["_id"])})
+    body = await request.json()
+    plan_id = body.get("plan_id", "tier1")
     
-    if not user_doc or not user_doc.get("stripe_customer_id"):
-        raise HTTPException(status_code=400, detail="No active subscription found")
+    if plan_id not in SUBSCRIPTION_PLANS or plan_id == "free":
+        raise HTTPException(status_code=400, detail="Invalid plan")
     
-    try:
-        origin_url = request.headers.get("origin", "")
-        session = stripe.billing_portal.Session.create(
-            customer=user_doc["stripe_customer_id"],
-            return_url=f"{origin_url}/subscription",
-        )
-        return {"url": session.url}
-    except Exception as e:
-        logger.error(f"Portal error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    # Update user subscription
+    await db.users.update_one(
+        {"_id": ObjectId(user["_id"])},
+        {"$set": {
+            "subscription": plan_id,
+            "subscription_status": "active",
+            "subscription_activated": datetime.now(timezone.utc).isoformat(),
+        }}
+    )
+    
+    # Update transaction
+    await db.payment_transactions.update_one(
+        {"user_id": user["_id"], "plan_id": plan_id, "payment_status": "pending"},
+        {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc)}},
+    )
+    
+    return {"status": "active", "plan_id": plan_id}
 
-@api_router.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
-    """Handle Stripe webhook events for subscription management."""
+@api_router.post("/webhook/authorize-net")
+async def authorize_webhook(request: Request):
+    """Handle Authorize.net webhook events."""
     try:
-        body = await request.body()
-        event = stripe.Event.construct_from(
-            stripe.util.convert_to_stripe_object(
-                stripe.util.json.loads(body), stripe.api_key
-            ), stripe.api_key
-        )
+        raw = await request.body()
+        import json as json_mod
+        event = json_mod.loads(raw)
+        event_id = event.get("notificationId") or event.get("id", str(uuid.uuid4()))
         
-        event_type = event.type
-        data = event.data.object
+        # Idempotency
+        if await db.webhook_events.find_one({"eventId": event_id}):
+            return {"ok": True}
+        await db.webhook_events.insert_one({"eventId": event_id, "event": event})
         
-        # Checkout completed — activate subscription
-        if event_type == "checkout.session.completed":
-            if data.mode == "subscription" and data.payment_status == "paid":
-                user_id = data.metadata.get("user_id")
-                plan_id = data.metadata.get("plan_id", "pro")
-                if user_id:
-                    await db.users.update_one(
-                        {"_id": ObjectId(user_id)},
-                        {"$set": {
-                            "subscription": plan_id,
-                            "stripe_subscription_id": data.subscription,
-                            "subscription_status": "active",
-                        }}
-                    )
-                    await db.payment_transactions.update_one(
-                        {"session_id": data.id},
-                        {"$set": {"payment_status": "paid", "paid_at": datetime.now(timezone.utc)}}
-                    )
+        typ = event.get("eventType", "")
+        sub_id = str(event.get("payload", {}).get("id", ""))
         
-        # Invoice paid — recurring payment succeeded
-        elif event_type == "invoice.paid":
-            sub_id = data.subscription
-            if sub_id:
-                await db.users.update_one(
-                    {"stripe_subscription_id": sub_id},
-                    {"$set": {"subscription_status": "active"}}
-                )
+        status_map = {
+            "net.authorize.customer.subscription.failed": "past_due",
+            "net.authorize.customer.subscription.suspended": "past_due",
+            "net.authorize.customer.subscription.cancelled": "cancelled",
+            "net.authorize.customer.subscription.terminated": "terminated",
+            "net.authorize.customer.subscription.expired": "expired",
+        }
+        status = status_map.get(typ)
+        if status and sub_id:
+            await db.subscriptions.update_one({"subscriptionId": sub_id}, {"$set": {"status": status}})
         
-        # Payment failed — Stripe will retry automatically
-        elif event_type == "invoice.payment_failed":
-            sub_id = data.subscription
-            if sub_id:
-                await db.users.update_one(
-                    {"stripe_subscription_id": sub_id},
-                    {"$set": {"subscription_status": "past_due"}}
-                )
-        
-        # Subscription cancelled
-        elif event_type == "customer.subscription.deleted":
-            sub_id = data.id
-            await db.users.update_one(
-                {"stripe_subscription_id": sub_id},
-                {"$set": {"subscription": "free", "subscription_status": "cancelled", "stripe_subscription_id": None}}
-            )
-        
-        # Subscription updated (upgrade/downgrade)
-        elif event_type == "customer.subscription.updated":
-            sub_id = data.id
-            status = data.status
-            if status == "active":
-                await db.users.update_one(
-                    {"stripe_subscription_id": sub_id},
-                    {"$set": {"subscription_status": "active"}}
-                )
-            elif status in ("past_due", "unpaid"):
-                await db.users.update_one(
-                    {"stripe_subscription_id": sub_id},
-                    {"$set": {"subscription_status": status}}
-                )
-            elif status == "canceled":
-                await db.users.update_one(
-                    {"stripe_subscription_id": sub_id},
-                    {"$set": {"subscription": "free", "subscription_status": "cancelled"}}
-                )
-        
-        return {"status": "ok"}
+        return {"ok": True}
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Authorize.net webhook error: {e}")
         return {"status": "error"}
 
 # ── Contact Models & Endpoints ──────────────────────────
@@ -1334,9 +1240,6 @@ async def startup():
     try:
         await db.users.create_index("email", unique=True)
         await db.login_attempts.create_index("identifier")
-        
-        # Setup Stripe recurring products/prices
-        await ensure_stripe_products()
         
         # Seed admin
         admin_email = os.environ.get("ADMIN_EMAIL", "admin@smokeguard.com")
