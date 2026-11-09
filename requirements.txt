@@ -1,4 +1,3 @@
---extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
 fastapi==0.110.1
 uvicorn==0.25.0
 python-dotenv>=1.0.1
@@ -10,9 +9,7 @@ pyjwt>=2.10.1
 dnspython==2.8.0
 requests>=2.31.0
 python-multipart>=0.0.9
-emergentintegrations==0.1.0
 twilio==9.10.5
 email-validator>=2.2.0
 certifi>=2026.2.25
 httpx>=0.27.0
-stripe>=9.0.0
