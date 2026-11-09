@@ -63,8 +63,13 @@ async def anet_request(body: dict) -> dict:
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
-client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
-db = client[os.environ.get('DB_NAME', 'test_database')]
+try:
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    db = client[os.environ.get('DB_NAME', 'test_database')]
+except Exception as e:
+    print(f"MongoDB connection error (will retry): {e}")
+    client = AsyncIOMotorClient('mongodb://localhost:27017', serverSelectionTimeoutMS=5000)
+    db = client[os.environ.get('DB_NAME', 'test_database')]
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
