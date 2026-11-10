@@ -1,1 +1,1 @@
-# THE FIRE APP - Smoke Guard v1.0
+# THE FIRE APP v2.0
