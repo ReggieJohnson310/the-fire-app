@@ -1168,6 +1168,106 @@ async def get_stats(request: Request):
         "subscription": user.get("subscription", "free") if user else "free",
     }
 
+# ── Gift Subscription (Admin Only) ──────────────────────
+
+class GiftRequest(BaseModel):
+    email: str
+    plan_id: str = "tier2"
+    name: str = ""
+
+@api_router.post("/admin/gift")
+async def gift_subscription(data: GiftRequest, request: Request):
+    """Admin gifts a free subscription to someone. Free forever."""
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    email = data.email.strip().lower()
+    plan_id = data.plan_id
+    
+    if plan_id not in SUBSCRIPTION_PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    
+    # Check if user exists, if not create account
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        # Update existing user to gifted plan
+        await db.users.update_one(
+            {"email": email},
+            {"$set": {
+                "subscription": plan_id,
+                "subscription_status": "active",
+                "gifted": True,
+                "gifted_by": user["email"],
+                "gifted_at": datetime.now(timezone.utc).isoformat(),
+                "gift_permanent": True,
+            }}
+        )
+        user_id = str(existing["_id"])
+    else:
+        # Create new user with gifted plan and temp password
+        import secrets as sec
+        temp_password = sec.token_urlsafe(8)
+        result = await db.users.insert_one({
+            "email": email,
+            "password_hash": hash_password(temp_password),
+            "name": data.name or email.split("@")[0],
+            "role": "user",
+            "subscription": plan_id,
+            "subscription_status": "active",
+            "gifted": True,
+            "gifted_by": user["email"],
+            "gifted_at": datetime.now(timezone.utc).isoformat(),
+            "gift_permanent": True,
+            "created_at": datetime.now(timezone.utc),
+        })
+        user_id = str(result.inserted_id)
+    
+    # Log the gift
+    await db.gifts.insert_one({
+        "id": str(uuid.uuid4()),
+        "gifted_to_email": email,
+        "gifted_to_name": data.name,
+        "plan_id": plan_id,
+        "gifted_by": user["email"],
+        "permanent": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    
+    plan_name = SUBSCRIPTION_PLANS.get(plan_id, {}).get("name", plan_id)
+    return {
+        "status": "gifted",
+        "email": email,
+        "plan": plan_name,
+        "permanent": True,
+        "message": f"Free {plan_name} plan gifted to {email} forever!"
+    }
+
+@api_router.get("/admin/gifts")
+async def list_gifts(request: Request):
+    """List all gifted subscriptions."""
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    gifts = await db.gifts.find({}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    return {"gifts": gifts, "total": len(gifts)}
+
+@api_router.delete("/admin/gift/{email}")
+async def revoke_gift(email: str, request: Request):
+    """Revoke a gifted subscription."""
+    user = await get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    email = email.strip().lower()
+    await db.users.update_one(
+        {"email": email},
+        {"$set": {"subscription": "free", "subscription_status": "cancelled", "gifted": False}}
+    )
+    await db.gifts.delete_many({"gifted_to_email": email})
+    return {"status": "revoked", "email": email}
+
 # ── Health ──────────────────────────────────────────────
 
 @api_router.get("/")
